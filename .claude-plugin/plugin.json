@@ -1,6 +1,6 @@
 {
   "name": "agent-office",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A live pixel office: Claude and every subagent get their own character and desk, animated by what they are doing right now.",
   "author": { "name": "9Bit Studios" },
   "homepage": "https://github.com/GameGuyy/agent-office",

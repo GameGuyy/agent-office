@@ -29,6 +29,8 @@ export const HUDDLE_MS = 8000
 export const LEAVE_GAP_MS = 2500
 /** How long a visiting agent stands talking at the other's desk. */
 const TALK_S = 4
+/** How long everyone takes to walk out of the office when usage runs out, before their homes show. */
+export const EXODUS_MS = 9000
 /** Long enough to stand somewhere until the next change redraws the office. */
 const FOREVER_S = 3600
 
@@ -54,11 +56,12 @@ export function layout(agents: OfficeAgent[], tasks: BgTask[]): Layout {
   const shown = agents.slice(0, MAX_DESKS)
   const cols = shown.length <= 6 ? 3 : 4
   const rows = Math.ceil(Math.max(shown.length, 3) / cols)
+  // background tasks have their racks in the basement now; they no longer size the office
   const racks = Math.min(tasks.length, MAX_RACKS)
   // the office is at least wide enough for your corner room beside the printer
-  const ox0 = Math.max(164, MX + cols * STEP_X + (racks ? 28 : 4) - 90)
-  const X = Math.max(MX + cols * STEP_X + (racks ? 28 : 4), ox0 + 74)
-  const Yd = Math.max(MY + rows * STEP_Y + 6, MY + racks * RACK_STEP + 14)
+  const ox0 = Math.max(164, MX + cols * STEP_X + 4 - 90)
+  const X = Math.max(MX + cols * STEP_X + 4, ox0 + 74)
+  const Yd = MY + rows * STEP_Y + 6
   const Y = Yd + LOUNGE
   const wy = Math.max(10, Math.round(Y * 0.16))
   const doorY = wy + 110 < Yd - 4 ? wy + 92 : Yd - 24
@@ -89,6 +92,8 @@ export type Actor = {
   says: { from: number; to: number; text: string; toCharacter?: number }[]
   /** Seconds into the timeline at which the agent sits down at its own desk and the figure goes. */
   seatedAt?: number
+  /** The figure goes at `seatedAt` but nobody sits down: it has left the office. */
+  leaves?: boolean
   /** Names the timeline, so a change of it redraws the office. */
   key: string
 }
@@ -247,6 +252,16 @@ export function stageActors(L: Layout, stage: Stage | undefined, now: number): A
   if (!stage) return []
   const S = spots(L)
   const out: Actor[] = []
+  // usage ran out: everyone gets up and walks out of the door, one after another
+  if (stage.away) {
+    L.shown.forEach((a, i) => {
+      const from = a.id === 'main' ? leadSpot(S, stage.lead.mode, i) : S.desk(i)
+      // a moment's wait each, so they leave one after another rather than in a heap
+      const tl = new Timeline(L).hold(from, 'nx', 'stand', 0.01 + i * 0.7).walk(path(L, from, [AISLE, S.door[1]])).walk([[AISLE, S.door[1]], S.door])
+      out.push({ id: a.id, character: a.character, start: stage.away!.since, legs: tl.legs, isLoop: false, says: i ? [] : [{ from: 0, to: 3, text: 'out of usage, see you soon! 👋' }], seatedAt: tl.t, leaves: true, key: `bye${a.id}` })
+    })
+    return out
+  }
   const lead = leadActor(L, S, stage, now)
   if (lead) out.push(lead)
 

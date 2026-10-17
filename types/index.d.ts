@@ -82,13 +82,22 @@ export type Stage = {
   crew: { id: string; joinedAt: number; leftAt?: number }[]
   /** An agent walking over to another's desk to say something. */
   visits: { from: string; to: string; at: number; text: string }[]
+  /**
+   * Usage ran out: everyone walked home at `since`, and stays there until the
+   * usage window resets at `resetsAt` (unknown when absent). `cast` are the
+   * characters whose homes are shown; `isPreview` for `/office homes`.
+   */
+  away?: { since: number; resetsAt?: number; cast: number[]; isPreview?: boolean }
 }
+
+/** How much of the usage window is spent, from the rate-limit readings: the fullest window. */
+export type Usage = { percent: number; resetsAt?: number; kind?: string }
 
 /** 'auto' follows the local clock. */
 export type Theme = 'auto' | 'day' | 'dusk' | 'night'
 
 /** What the 3D drawing was last drawn from: changes seldom, so the drawing holds still. */
-export type Scene = { at: number; agents: OfficeAgent[]; tasks: BgTask[]; stats: OfficeStats; hour?: number; chat?: ChatLine[]; stage?: Stage; theme?: Theme }
+export type Scene = { at: number; agents: OfficeAgent[]; tasks: BgTask[]; stats: OfficeStats; hour?: number; chat?: ChatLine[]; stage?: Stage; theme?: Theme; usage?: Usage }
 
 /** What the text rows under the drawing show: refreshed once a second at most. */
 export type Live = { at: number; agents: OfficeAgent[]; tasks: BgTask[]; feed: FeedLine[]; stats: OfficeStats; chat?: ChatLine[] }
@@ -108,6 +117,8 @@ declare module 'claude-code' {
       /** Draws the office in a sandboxed frame so hover tooltips work. */
       inspect: boolean
       stage: Stage
+      /** The latest usage reading, when the account reports one. */
+      usage: Usage | null
       scene: Scene
       /**
        * The two pictures the pane stacks: a new scene always goes into the one

@@ -1,7 +1,7 @@
-import type { BgTask, ChatLine, OfficeAgent, OfficeStats, Theme } from '../types'
+import type { BgTask, ChatLine, OfficeAgent, OfficeStats, Theme, Usage } from '../types'
 import { KIND_LABEL, STATUS_COLOR, activityLine, character, clip, fmtAge, levelOf, localSeconds, phaseOf, subtitle } from './office'
 import type { Character, DeskItem, Phase } from './office'
-import { CHAT_SHOW_MS, GREET_MS, MAX_DESKS, MX, MY, RACK_STEP, STEP_X, STEP_Y, layout, stageActors, standing } from './stage'
+import { CHAT_SHOW_MS, GREET_MS, MAX_DESKS, MX, MY, STEP_X, STEP_Y, layout, stageActors, standing } from './stage'
 import type { Actor, Layout, Leg as StageLeg } from './stage'
 import type { Stage } from '../types'
 
@@ -62,6 +62,12 @@ function mat(a: number, b: number, c: number, d: number, x: number, y: number, z
 const onFront = (x: number, y: number, z: number, inner: string) => mat(1, 0.5, 0, 1, x, y, z, inner)
 /** The same on a face toward +x: u runs along +y. */
 const onSide = (x: number, y: number, z: number, inner: string) => mat(-1, 0.5, 0, 1, x, y, z, inner)
+/**
+ * Writing on a face toward +x that reads left to right: `onSide` runs u along
+ * +y, which mirrors text, so this runs it along -y from (x, y, z), the left
+ * end as you look at the wall.
+ */
+const onSideText = (x: number, y: number, z: number, inner: string) => mat(1, -0.5, 0, 1, x, y, z, inner)
 
 const at = (x: number, y: number, inner: string) => `<g transform="translate(${f(x)} ${f(y)})">${inner}</g>`
 
@@ -111,6 +117,9 @@ text{font-family:ui-monospace,'Cascadia Mono',Consolas,Menlo,monospace}
 .mote{animation:mote 9s ease-in-out infinite}
 @keyframes mote{0%,100%{transform:translate(0,0);opacity:0}20%,80%{opacity:.8}50%{transform:translate(6px,-9px)}}
 .pop{animation:pop .35s ease-out both}
+.needle{animation:needle 2.8s ease-in-out infinite alternate}
+@keyframes needle{from{transform:rotate(-1.4deg)}to{transform:rotate(1.4deg)}}
+.beacon{animation:spin 1.2s linear infinite}
 .bub{opacity:0;animation:bub ${CHAT_SHOW_MS / 1000}s linear 1 forwards}
 @keyframes bub{0%,96%{opacity:1}100%{opacity:0}}
 .show{opacity:0;animation:show .01s linear 1 forwards}
@@ -156,6 +165,8 @@ const DEFS =
   // warm exposed brick for the upper walls, one for each wall's plane
   brick('brF', 'matrix(1 .5 0 1 0 0)', 0) +
   brick('brS', 'matrix(-1 .5 0 1 0 0)', -0.08) +
+  `<pattern id="tiles" width="16" height="16" patternUnits="userSpaceOnUse" patternTransform="matrix(1 .5 -1 .5 0 0)">${r(0, 0, 16, 16, '#666b78')}${r(0, 0, 16, 0.6, '#555a66')}${r(0, 0, 0.6, 16, '#555a66')}</pattern>` +
+  idleRackDef() +
   `<filter id="glow" x="-30%" y="-60%" width="160%" height="220%"><feGaussianBlur stdDeviation="1.6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>` +
   `<g id="desk">` +
   box(9, 7, 4, 40, 2, 11, '#6d4a2b') +
@@ -186,6 +197,61 @@ const DEFS =
   `</g>` +
   `<g id="backW">${box(29, 42, 11, 2, 2, 4, METAL)}${box(22, 43, 14, 16, 3, 9, CHAIR, { top: '#45485c' })}</g>` +
   `<g id="backR">${box(22, 28, 14, 16, 3, 13, CHAIR, { top: '#45485c' })}</g>`
+
+/**
+ * The power gauge on the wall: a neon dial, green into amber into red, its
+ * needle on how much of the usage window is spent, what is left in a readout,
+ * when it refills underneath, and a beacon that wakes up near the limit.
+ */
+function usageMeter(u: Usage): string {
+  const used = Math.max(0, Math.min(100, u.percent))
+  const left = Math.round(100 - used)
+  const isLow = used >= 90
+  const color = isLow ? '#ef4444' : used >= 80 ? '#f59e0b' : '#22c55e'
+  const cx = 17
+  const cy = 18
+  const R = 11.5
+  const pt = (pct: number, rad = R): [number, number] => {
+    const a = ((180 - 1.8 * pct) * Math.PI) / 180
+    return [cx + rad * Math.cos(a), cy - rad * Math.sin(a)]
+  }
+  const arc = (p0: number, p1: number, c: string, w: number, extra = '') => {
+    const [x0, y0] = pt(p0)
+    const [x1, y1] = pt(p1)
+    return `<path d="M${f(x0)},${f(y0)} A${R},${R} 0 0 1 ${f(x1)},${f(y1)}" fill="none" stroke="${c}" stroke-width="${w}"${extra ? ' ' + extra : ''}/>`
+  }
+  let ticks = ''
+  for (let k = 0; k <= 10; k++) {
+    const [a1, b1] = pt(k * 10, R - 2.4)
+    const [a2, b2] = pt(k * 10, R - (k % 5 ? 3.4 : 4.4))
+    ticks += `<line x1="${f(a1)}" y1="${f(b1)}" x2="${f(a2)}" y2="${f(b2)}" stroke="#9aa3b5" stroke-width="${k % 5 ? 0.35 : 0.6}"/>`
+  }
+  const angle = -90 + 1.8 * used
+  return (
+    // the housing, a brass rim, a label
+    r(-1, -1, 36, 33, '#141726', 'rx="3" stroke="#c9a227" stroke-width="1.2"') +
+    `<text x="17" y="4.6" font-size="3" font-weight="700" fill="#c9a227" text-anchor="middle" letter-spacing=".4">⚡ POWER</text>` +
+    // the dial: dim zones, then the spent part lit and glowing
+    arc(0, 60, '#22c55e', 2.4, 'opacity=".25"') +
+    arc(60, 80, '#f59e0b', 2.4, 'opacity=".25"') +
+    arc(80, 100, '#ef4444', 2.4, 'opacity=".25"') +
+    (used > 0.5 ? arc(0, used, color, 2.4, 'filter="url(#glow)"') : '') +
+    ticks +
+    // the needle, never quite still, and its cap
+    `<g style="transform-box:view-box;transform-origin:${cx}px ${cy}px;transform:rotate(${angle.toFixed(1)}deg)"><g class="needle" style="transform-box:view-box;transform-origin:${cx}px ${cy}px">` +
+    `<polygon points="${cx - 0.7},${cy} ${cx + 0.7},${cy} ${cx},${cy - R + 1.5}" fill="#f4f1de"/></g></g>` +
+    `<circle cx="${cx}" cy="${cy}" r="1.8" fill="#c9a227" stroke="#2b2d42" stroke-width=".5"/>` +
+    // the readout, and when it refills
+    r(6, 21.5, 22, 5.5, '#0a0d14', `rx="1" stroke="${color}" stroke-opacity=".6" stroke-width=".4"`) +
+    `<text x="17" y="25.6" font-size="3.6" font-weight="700" fill="${color}" text-anchor="middle"${isLow ? ' class="blink"' : ''}>${left}% LEFT</text>` +
+    `<text x="17" y="30.4" font-size="2.6" fill="${isLow ? '#fca5a5' : '#9aa3b5'}" text-anchor="middle">${isLow ? '⚠ HOME SOON' : u.resetsAt ? `↻ refills ${esc(clockTime(u.resetsAt))}` : 'usage window'}</text>` +
+    // near the limit, a beacon on top starts turning
+    (isLow
+      ? `<circle cx="31" cy="-2" r="2.6" fill="#7f1d1d"/><circle cx="31" cy="-2.6" r="2" fill="#ef4444" class="blink"/>` +
+        `<g style="transform-box:view-box;transform-origin:31px -2.6px" class="beacon"><polygon points="31,-2.6 41,-6 41,0.8" fill="#ef4444" opacity=".35"/></g>`
+      : '')
+  )
+}
 
 /** A brick bond, laid on one wall's plane. */
 function brick(id: string, transform: string, dim: number): string {
@@ -1162,6 +1228,76 @@ function street(X: number, Y: number, light: Light, isLite: boolean, pools: Set<
   return { ground, front: front + cars, lights, css }
 }
 
+// ---------------------------------------------------------------- basement
+
+/** The server hall's depth (y), its height, and how far below the office it is drawn. */
+const BD = 72
+const BH = 44
+/** Rack slots along each of the hall's two rows. */
+const RACK_PITCH = 18
+
+/** An idle rack: dark, a light or two ticking over. Drawn once, placed by reference. */
+function idleRackDef(): string {
+  let units = ''
+  for (let i = 0; i < 4; i++) units += r(1, 2 + i * 8, 10, 6.5, '#13151c') + r(2.2, 4 + i * 8, 1.2, 1.2, '#2f6b4a', i % 2 ? 'class="led"' : '')
+  return `<g id="rackIdle">${box(0, 0, 0, 12, 10, 36, '#23262f', { top: '#2d313c' })}${onFront(0, 10, 36, units)}</g>`
+}
+
+/**
+ * The basement: a concrete server hall with a rack for every background task,
+ * lit and labelled, and idle racks filling the rows. Drawn in its own frame,
+ * world origin at its back corner; the caller places it under the office.
+ */
+function basement(X: number, tasks: BgTask[], agents: OfficeAgent[], now: number, light: Light, pools: Set<string>) {
+  const CONCRETE = '#7a7f8c'
+  const slots = Math.max(4, Math.floor((X - 30) / RACK_PITCH))
+  const rows: { x: number; y: number }[] = []
+  for (const y of [9, 44]) for (let i = 0; i < slots; i++) rows.push({ x: 16 + i * RACK_PITCH, y })
+  const running = tasks.slice(0, rows.length)
+  let body =
+    // the slab, the two walls, and a floor of tiles
+    box(-5, -5, -8, X + 5, BD + 5, 8, '#4a4e59', { top: '#5d626e', front: '#3c3f48', side: '#34363e' }) +
+    poly([[0, 0, 0.05], [X, 0, 0.05], [X, BD, 0.05], [0, BD, 0.05]], 'url(#tiles)') +
+    box(-5, -5, 0, X + 5, 5, BH, CONCRETE, { top: '#5a5e69', front: CONCRETE, side: shade(CONCRETE, -0.12) }) +
+    box(-5, 0, 0, 5, BD, BH, shade(CONCRETE, -0.08), { top: '#5a5e69', front: shade(CONCRETE, -0.2), side: shade(CONCRETE, -0.08) }) +
+    // pipes and a cable tray along the back wall, strip lights under the ceiling
+    onFront(0, 0, BH - 3, r(0, 0, X, 2.4, '#b5523b') + r(0, 4, X, 1.6, '#3d8b8b') + r(0, 8, X, 3, '#2b2d42') + r(0, 8, X, 0.6, '#ffd166', 'opacity=".4"')) +
+    onSide(0, 0, BH - 3, r(0, 0, BD, 2.4, '#9b4433') + r(0, 4, BD, 1.6, '#357a7a')) +
+    [0.25, 0.5, 0.75].map(k => onFront(X * k - 10, 0, 6, r(0, 0, 20, 1.6, '#e8f4fd'))).join('') +
+    // a sign: which floor this is
+    onSideText(0, 54, 36, r(0, 0, 46, 13, '#1b1f2e', 'rx="1.5"') + `<text x="23" y="6" font-size="4.4" font-weight="700" fill="#7ee081" text-anchor="middle">B1 · SERVERS</text>` + `<text x="23" y="11" font-size="3.2" fill="#9aa3b5" text-anchor="middle">${running.length} task${running.length === 1 ? '' : 's'} running</text>`)
+  let overlays = ''
+  let lights = ''
+  const tops = new Map<string, [number, number]>()
+  // back row first, then the front; each slot either a running task's rack or an idle one
+  const order = [...rows].sort((a, b) => a.y - b.y || a.x - b.x)
+  order.forEach((slot, k) => {
+    const [sx, sy] = P(slot.x, slot.y, 0)
+    const t = running[k]
+    if (!t) {
+      body += at(sx, sy, `<use href="#rackIdle"/>`)
+      return
+    }
+    const crew = t.runId ? agents.filter(a => a.group === t.runId && a.status !== 'done').length : 0
+    const rk = rack(t, now, k, crew)
+    body += at(sx, sy, rk.body)
+    overlays += at(sx, sy, rk.overlay)
+    if (t.runId) tops.set(t.runId, P(slot.x + 6, slot.y + 5, 36))
+    const [gx, gy] = P(slot.x + 6, slot.y + 14, 0)
+    lights += pool(pools, t.kind === 'workflow' ? '#c084fc' : '#3ddc84', gx, gy, 18, 9, 0.35 + light.glow * 0.3)
+  })
+  if (tasks.length > running.length) {
+    const [sx, sy] = P(X - 30, BD - 6, 4)
+    overlays += at(sx, sy, miniTag(`+${tasks.length - running.length} more`, '#9aa3b5', 'running'))
+  }
+  // the hall's own cool light, whatever the time of day
+  for (const k of [0.25, 0.5, 0.75]) {
+    const [lx, ly] = P(X * k, BD / 2, 0)
+    lights += pool(pools, '#9fd3ff', lx, ly, 40, 20, 0.22)
+  }
+  return { body, overlays, lights, tops }
+}
+
 // ---------------------------------------------------------------- room
 
 const WALL_H = 72
@@ -1189,6 +1325,8 @@ export type RenderOptions = {
   lite?: boolean
   /** Who is walking where: the lead, new crew, visits, you at the door. */
   stage?: Stage
+  /** How much usage is spent, for the meter on the wall. */
+  usage?: Usage
   /** The last resort near the size bound: the sky only, no street. */
   bare?: boolean
 }
@@ -1329,11 +1467,14 @@ function yourOffice(L: Layout, said: string | undefined, sinceS: number): { glas
     box(dx + 9, y0 + 20, 17.4, 3, 3, 4, '#ffd166', { top: '#6b3e26' }) +
     box(dx - 14, y0 + 19, 17.4, 4, 4, 1, '#333') +
     box(dx - 12.5, y0 + 20.5, 18.4, 1, 1, 8, '#555') +
-    box(dx - 14.5, y0 + 19, 26, 5, 4, 3, '#e9c46a')
+    box(dx - 14.5, y0 + 19, 26, 5, 4, 3, '#e9c46a') +
+    // the name plate: a walnut block with a brass face
+    box(dx - 8, y0 + 25.5, 17.4, 16, 2.6, 4.4, '#5e3d22', { top: '#7a5230' }) +
+    onFront(dx - 8, y0 + 28.1, 21.8, r(0.8, 0.6, 14.4, 3.2, '#d4a72c') + r(0.8, 0.6, 14.4, 0.6, '#f5d77a') + `<text x="8" y="3.2" font-size="2.6" font-weight="700" fill="#2b1d0e" text-anchor="middle" letter-spacing=".5">CEO</text>`)
   // up and to the right of your head, clear of whoever stands at your desk
   const [hx0, hy0] = P(dx, y0 + 10, 40)
   const [hx, hy] = [hx0 + 26, hy0 - 12]
-  let talk = `<path d="M${f(hx0 + 3)},${f(hy0 + 2)} L${f(hx - 6)},${f(hy)}" stroke="${YOU.accent}" stroke-width=".6" opacity=".7"/>` + at(hx, hy, miniTag('You', YOU.accent, said ? 'just asked' : 'in your office'))
+  let talk = `<path d="M${f(hx0 + 3)},${f(hy0 + 2)} L${f(hx - 6)},${f(hy)}" stroke="${YOU.accent}" stroke-width=".6" opacity=".7"/>` + at(hx, hy, miniTag('👑 You', '#fbbf24', said ? 'CEO · just asked' : 'CEO'))
   if (said) talk += at(hx, hy - 10, `<g class="say1" style="animation-delay:-${sinceS.toFixed(2)}s">${speech(said, YOU.accent)}</g>`)
   return { glass, inside, talk }
 }
@@ -1350,10 +1491,10 @@ function door(y: number, isOpen: boolean): string {
         r(0, 0, 16, 32, isOpen ? '#20253a' : '#a8774d') +
         (isOpen
           ? r(0, 0, 3, 32, '#8b5e3c')
-          : r(2, 3, 12, 11, 'none', 'stroke="#8b5e3c" stroke-width=".8"') + r(2, 17, 12, 12, 'none', 'stroke="#8b5e3c" stroke-width=".8"') + `<circle cx="13" cy="17" r="1" fill="#f4d35e"/>`) +
-        r(3, -6.5, 10, 4, '#1b1f2e', 'rx="1"') +
-        `<text x="8" y="-3.5" font-size="2.6" fill="#7ee081" text-anchor="middle">EXIT</text>`,
-    )
+          : r(2, 3, 12, 11, 'none', 'stroke="#8b5e3c" stroke-width=".8"') + r(2, 17, 12, 12, 'none', 'stroke="#8b5e3c" stroke-width=".8"') + `<circle cx="13" cy="17" r="1" fill="#f4d35e"/>`),
+    ) +
+    // the sign over it, readable from the room
+    onSideText(0, y + 13, 38.5, r(0, 0, 10, 4, '#1b1f2e', 'rx="1"') + `<text x="5" y="3" font-size="2.6" fill="#7ee081" text-anchor="middle">EXIT</text>`)
   )
 }
 
@@ -1393,7 +1534,6 @@ function drawOffice(
   const pools = new Set<string>()
   const L: Layout = layout(agents, tasks)
   const { shown, cols, rows, X, Yd, Y, wy } = L
-  const racks = tasks.slice(0, L.racks)
   // who is on their feet by the stage: the lead, new crew, visits, you at the door
   const actors = maxWalkers >= 0 ? standing(stageActors(L, options.stage, now), now) : []
   const onStage = new Set(actors.map(a => a.id))
@@ -1459,6 +1599,8 @@ function drawOffice(
       r(10.7, 2.6, 0.6, 10, '#e63946', `class="hand" ${hand(60, 'steps(60)')}`) +
       `<circle cx="11" cy="11" r="1.3" fill="#2e3548"/></svg>`,
   )
+  // the usage meter under the clock: a battery of what is left, amber when low, red and blinking when nearly out
+  if (options.usage) room += onFront(X - 47, 0, 40, usageMeter(options.usage))
   // the windows themselves: glass, frames, sills with plants, curtains on the side wall
   backHoles.forEach((h, i) => (room += windowDressing(true, h, i)))
   leftHoles.forEach((h, i) => (room += windowDressing(false, h, i + 2)))
@@ -1477,7 +1619,7 @@ function drawOffice(
   const tagsAt = new Map<string, [number, number]>()
   // agents walking to their own desk, and how many seconds until they sit down
   const arriving = new Map<string, number>()
-  for (const a of actors) if (a.seatedAt !== undefined) arriving.set(a.id, a.seatedAt - (now - a.start) / 1000)
+  for (const a of actors) if (a.seatedAt !== undefined && !a.leaves) arriving.set(a.id, a.seatedAt - (now - a.start) / 1000)
   const arrivingTags = new Map<string, [number, number]>()
   let lights = ''
   for (let i = 0; i < rows * cols; i++) {
@@ -1529,28 +1671,27 @@ function drawOffice(
     overlays += w.label
   })
 
-  // the racks stand to the right of the right aisle, in front of anyone on it
-  let rackBodies = ''
+  // the basement: the server hall, drawn under the office in its own frame
+  const TY = (X + Y) / 2 + 56 + BH - 24
+  const hall = basement(X, tasks, agents, now, light, pools)
+  const down = (inner: string) => `<g transform="translate(0 ${f(TY)})">${inner}</g>`
+  overlays += down(hall.overlays)
+  lights += down(hall.lights)
   const rackTops = new Map<string, [number, number]>()
-  racks.forEach((t, k) => {
-    const ox = MX + cols * STEP_X + 10
-    const oy = MY + 2 + k * RACK_STEP
-    const crew = t.runId ? agents.filter(a => a.group === t.runId && a.status !== 'done').length : 0
-    const rk = rack(t, now, k, crew)
-    const [sx, sy] = P(ox, oy, 0)
-    rackBodies += at(sx, sy, rk.body)
-    overlays += at(sx, sy, rk.overlay)
-    if (t.runId) rackTops.set(t.runId, P(ox + 6, oy + 5, 36))
-    const [gx, gy] = P(ox + 6, oy + 12, 18)
-    lights += pool(pools, t.kind === 'workflow' ? '#c084fc' : '#3ddc84', gx, gy, 16, 9, light.glow * 0.7)
-  })
+  for (const [id, [x, y]] of hall.tops) rackTops.set(id, [x, y + TY])
+  // a glass lift shaft between the floors, a car riding it
+  const [shx] = P(8, BD - 14, 0)
+  const shTop = (8 + BD - 14) / 2 + 16
+  const shBottom = TY + (8 + BD - 14) / 2 - BH
+  const shaft =
+    `<rect x="${f(shx - 8)}" y="${f(shTop)}" width="16" height="${f(shBottom - shTop)}" fill="#bfe3ee" opacity=".35" stroke="#3d3a4b" stroke-width="1.4"/>` +
+    `<rect x="${f(shx - 0.5)}" y="${f(shTop)}" width="1" height="${f(shBottom - shTop)}" fill="#3d3a4b" opacity=".6"/>` +
+    `<g style="animation:lift 14s ease-in-out infinite alternate"><rect x="${f(shx - 6)}" y="${f(shTop + 4)}" width="12" height="16" rx="1.5" fill="#e0b04e" stroke="#7a5a1e" stroke-width=".8"/>` +
+    `<rect x="${f(shx - 4)}" y="${f(shTop + 7)}" width="8" height="6" fill="#fff6c9" opacity=".8"/></g>`
+  const liftCss = `@keyframes lift{0%,15%{transform:translateY(0)}85%,100%{transform:translateY(${f(shBottom - shTop - 24)}px)}}`
   if (agents.length > shown.length) {
     const [sx, sy] = P(MX + 4, Yd, 4)
     overlays += at(sx, sy, miniTag(`+${agents.length - shown.length} more agents`, '#9aa3b5', 'off screen'))
-  }
-  if (tasks.length > racks.length) {
-    const [sx, sy] = P(MX + cols * STEP_X + 16, MY + 2 + racks.length * RACK_STEP, 6)
-    overlays += at(sx, sy, miniTag(`+${tasks.length - racks.length} more background tasks`, '#9aa3b5', 'running'))
   }
 
   // the break corner, in front of everything else on the floor, and your office
@@ -1601,7 +1742,7 @@ function drawOffice(
   const minX = -Y - 54
   const maxX = X + 54
   const minY = -WALL_H - 18
-  const maxY = (X + Y) / 2 + 58
+  const maxY = TY + (X + BD) / 2 + 14
   const city = options.bare ? { ground: '', front: '', lights: '', css: '' } : street(X, Y, light, !!options.lite, pools)
   lights += city.lights
   const W = maxX - minX
@@ -1614,16 +1755,17 @@ function drawOffice(
     cityDefs(light)
   const source =
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${f(minX)} ${f(minY)} ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="background:#0d0f16">` +
-    `<style>${CSS}${strollers.length ? walkCss(plan) : ''}${painted.css}${city.css}</style><defs>${DEFS}${sky}${[...sprites.values()].join('')}</defs>` +
+    `<style>${CSS}${strollers.length ? walkCss(plan) : ''}${painted.css}${city.css}${liftCss}</style><defs>${DEFS}${sky}${[...sprites.values()].join('')}</defs>` +
     full('url(#skybg)') +
     skyLights(light, minX, minY, W) +
+    shaft +
+    down(hall.body) +
     city.ground +
     room +
     layer('back') +
     walkBack +
     bodies +
     walkFront +
-    rackBodies +
     corner.couch +
     layer('lounge') +
     corner.rest +
@@ -1649,4 +1791,159 @@ export function describeOffice(agents: OfficeAgent[], tasks: BgTask[]): string {
   const people = agents.map(a => `${character(a.character).name} (${subtitle(a)}) ${activityLine(a)}`)
   const jobs = tasks.map(t => `task: ${t.label}`)
   return people.length + jobs.length === 0 ? 'An empty office.' : 'Agent office: ' + [...people, ...jobs].join('; ')
+}
+
+// ---------------------------------------------------------------- homes
+
+/** What each agent does at home, by its place in the cast; the lead always sleeps it off. */
+type Pastime = 'sleep' | 'sofa' | 'cook' | 'game' | 'read'
+const PASTIMES: Pastime[] = ['sleep', 'sofa', 'cook', 'game', 'read', 'sofa']
+const PASTIME_LINE: Record<Pastime, string> = {
+  sleep: 'recharging… zzz',
+  sofa: 'watching a show',
+  cook: 'cooking dinner',
+  game: 'playing games',
+  read: 'reading with a tea',
+}
+
+const PLOT = 84
+const HOME = 60
+const HOME_H = 36
+
+/** A clock time as people read it: 4:30 PM. */
+export function clockTime(ms: number): string {
+  try {
+    const d = new Date(ms)
+    const h = d.getHours()
+    const m = String(d.getMinutes()).padStart(2, '0')
+    return `${((h + 11) % 12) + 1}:${m} ${h < 12 ? 'AM' : 'PM'}`
+  } catch {
+    return ''
+  }
+}
+
+/** Lying in bed under a blanket in the agent's colour, head on the pillow. */
+function sleeper(ch: Character): string {
+  return (
+    box(10, 8, 0, 34, 20, 6, '#8b5e3c', { top: '#a8774d' }) +
+    box(8, 8, 0, 2.5, 20, 14, '#6d4a2b') +
+    box(11, 9, 6, 32, 18, 3, '#f4f1e8') +
+    box(12, 11, 9, 8, 14, 2.5, '#ffffff') +
+    box(20, 9, 9, 22, 18, 4, ch.shirt, { top: shade(ch.shirt, 0.12) }) +
+    box(13, 14, 11.5, 7, 8, 6, ch.hair, { front: ch.skin, side: ch.skin, top: ch.hair }) +
+    at(...P(16, 18, 26), `<g class="zz"><text font-size="6" font-weight="700" fill="#cdb4ff">z</text><text x="4" y="-5" font-size="8" font-weight="700" fill="#cdb4ff">Z</text></g>`)
+  )
+}
+
+/** One home: a cutaway room on its plot, its owner doing something cozy in it. */
+function home(charIndex: number, k: number, light: Light): { body: string; label: string } {
+  const ch = character(charIndex)
+  const pastime = charIndex === 0 ? 'sleep' : (PASTIMES[k % PASTIMES.length] ?? 'sofa')
+  const wall = ['#e6c99a', '#d4838f', '#7fa99b', '#e0b04e', '#8c6d9e', '#c8735a'][k % 6] ?? '#e6c99a'
+  const floor = ['#c79d6d', '#a8774d', '#d9b38c'][k % 3] ?? '#c79d6d'
+  let s =
+    // the yard, the floor, and two walls with a window each
+    box(-8, -8, -4, PLOT - 8, PLOT - 8, 4, '#5b8a3c', { top: '#6fa14a', front: '#4a3a2a', side: '#3d3022' }) +
+    box(0, 0, 0, HOME, HOME, 2, floor, { top: floor, front: shade(floor, -0.3), side: shade(floor, -0.38) }) +
+    box(-3, -3, 2, HOME + 3, 3, HOME_H, wall, { top: shade(wall, -0.25), front: wall, side: shade(wall, -0.15) }) +
+    box(-3, 0, 2, 3, HOME, HOME_H, shade(wall, -0.1), { top: shade(wall, -0.25), front: shade(wall, -0.3), side: shade(wall, -0.1) }) +
+    onFront(HOME - 22, 0, 30, r(0, 0, 14, 12, light.isNight ? '#1c2754' : '#9fd3f5') + r(6.5, 0, 1, 12, '#5e3d22') + r(0, 0, 14, 12, 'none', 'stroke="#5e3d22" stroke-width="1.2"')) +
+    onSide(0, 34, 30, r(0, 0, 14, 12, light.isNight ? '#1c2754' : '#9fd3f5') + r(0, 5.5, 14, 1, '#5e3d22') + r(0, 0, 14, 12, 'none', 'stroke="#5e3d22" stroke-width="1.2"')) +
+    // a rug, a lamp in the corner, a picture
+    poly([[14, 30, 2.1], [46, 30, 2.1], [46, 54, 2.1], [14, 54, 2.1]], ['#2a6f6b', '#8c3b2f', '#3d5a80'][k % 3] ?? '#2a6f6b', 'opacity=".6"') +
+    box(4, 4, 2, 4, 4, 1, '#2b2d42') + box(5.5, 5.5, 3, 1, 1, 18, '#2b2d42') + box(3, 3, 21, 6, 6, 5, '#f6d7a7', { top: '#fff1cf' }) +
+    onFront(10, 0, 28, r(0, 0, 12, 9, '#5e3d22') + r(1, 1, 10, 7, ['#e76f51', '#2a9d8f', '#f4d35e'][k % 3] ?? '#e76f51'))
+  switch (pastime) {
+    case 'sleep':
+      s += sleeper(ch)
+      break
+    case 'sofa':
+    case 'read': {
+      // a sofa against the side wall, the owner on it with a hot drink; a TV across the room
+      s += box(2, 18, 2, 12, 26, 6, '#b5523b') + box(2, 18, 8, 4, 26, 9, shade('#b5523b', -0.1)) + box(2, 16, 2, 12, 3, 11, '#a3462f') + box(2, 43, 2, 12, 3, 11, '#a3462f')
+      s += at(...P(9, 32, 2), sitSprite(ch))
+      if (pastime === 'sofa') {
+        s += box(44, 24, 2, 4, 18, 14, '#1b1f2e') + box(44, 25, 6, 0.6, 16, 9, '#000', { side: '#4cc9f0' }) + onSide(44.6, 25, 15, r(0, 0, 16, 9, '#7fd8ff', 'class="tv"'))
+      } else {
+        s += box(20, 26, 2, 8, 8, 8, '#8b5e3c', { top: '#a8774d' }) + box(21, 27, 10, 5, 4, 1.4, '#e63946') + box(22, 31, 10, 3, 3, 3.5, '#f1f1f1', { top: '#6b3e26' })
+      }
+      break
+    }
+    case 'cook': {
+      // a kitchen counter along the back wall, a pot steaming, the owner at the stove
+      s += box(8, 2, 2, 44, 12, 14, '#e8e2d0', { top: '#5e3d22' }) + box(26, 4, 16, 8, 8, 5, '#3a3f4b') + box(40, 4, 16, 6, 6, 3, '#e63946')
+      s += at(...P(30, 8, 22), `<g class="steam">${r(-1, -5, 0.9, 4, '#ffffffbb')}${r(1.5, -7, 0.9, 4, '#ffffffbb')}</g>`)
+      s += at(...P(30, 22, 2), walkerSprite(ch, 'ny', 'stand'))
+      break
+    }
+    case 'game': {
+      // a gaming desk, the screen glowing, the owner at it
+      s += at(...P(4, 4, 2), `<use href="#desk"/>` + working({ id: `home${k}`, character: charIndex, role: '', task: '', status: 'running', detail: '', joinedAt: 0, updatedAt: 0, tools: 0, active: 1 }, ch))
+      break
+    }
+  }
+  const [lx, ly] = P(HOME / 2, HOME / 2, HOME_H + 14)
+  return { body: s, label: at(lx, ly, miniTag(`${ch.name}'s home`, ch.accent, PASTIME_LINE[pastime])) }
+}
+
+/**
+ * Where everyone is when usage has run out: a little neighbourhood of homes,
+ * one per agent, each doing something cozy, under a sign saying when they are
+ * back, its bar filling up by itself until then.
+ */
+export function renderHomes(cast: number[], since: number, resetsAt: number | undefined, now: number, options: { theme?: Theme; hour?: number } = {}): { source: string; width: number; height: number } {
+  const light = LIGHT[phaseOf(options.theme ?? 'auto', options.hour ?? 12)]
+  const people = (cast.length ? cast : [0]).slice(0, 6)
+  const cols = Math.min(3, people.length)
+  const rows = Math.ceil(people.length / cols)
+  const W = cols * PLOT
+  const D = rows * PLOT
+  let bodies = ''
+  let labels = ''
+  // back to front, so nearer homes are painted over farther ones
+  const order = people.map((c, k) => ({ c, k, ox: (k % cols) * PLOT, oy: Math.floor(k / cols) * PLOT })).sort((a, b) => a.oy - b.oy || a.ox - b.ox)
+  for (const { c, k, ox, oy } of order) {
+    const h = home(c, k, light)
+    const [sx, sy] = P(ox, oy, 0)
+    bodies += at(sx, sy, h.body)
+    labels += at(sx, sy, h.label)
+  }
+  const minX = -D - 24
+  const maxX = W + 24
+  const minY = -HOME_H - 70
+  const maxY = (W + D) / 2 + 20
+  const VW = maxX - minX
+  const VH = maxY - minY
+  // the sign: when everyone is back, and a bar that fills by itself until then
+  const total = resetsAt ? Math.max(1, resetsAt - since) : 0
+  const done = resetsAt ? Math.min(1, Math.max(0, (now - since) / total)) : 0
+  const left = resetsAt ? Math.max(0, (resetsAt - now) / 1000) : 0
+  const sw = Math.min(260, VW - 40)
+  const sx0 = minX + (VW - sw) / 2
+  const sy0 = minY + 8
+  const sign =
+    `<rect x="${f(sx0)}" y="${f(sy0)}" width="${f(sw)}" height="40" rx="6" fill="#121521" fill-opacity=".9" stroke="#cdb4ff" stroke-opacity=".6"/>` +
+    `<text x="${f(sx0 + sw / 2)}" y="${f(sy0 + 13)}" font-size="8" font-weight="700" fill="#ffd166" text-anchor="middle">🏠 Out of usage · everyone went home</text>` +
+    `<text x="${f(sx0 + sw / 2)}" y="${f(sy0 + 24)}" font-size="6" fill="#d5dae4" text-anchor="middle">${resetsAt ? `Back at ${esc(clockTime(resetsAt))}, when usage resets` : 'Back when usage resets'}</text>` +
+    `<rect x="${f(sx0 + 12)}" y="${f(sy0 + 30)}" width="${f(sw - 24)}" height="4" rx="2" fill="#2b2d42"/>` +
+    (resetsAt
+      ? `<rect x="${f(sx0 + 12)}" y="${f(sy0 + 30)}" width="${f(sw - 24)}" height="4" rx="2" fill="#7ee081" style="transform-box:fill-box;transform-origin:0 50%;transform:scaleX(${done.toFixed(4)});animation:fill ${left.toFixed(0)}s linear 1 forwards"/>`
+      : '')
+  const css = `${CSS}@keyframes fill{to{transform:scaleX(1)}}.zz{animation:zz 3s ease-in-out infinite}@keyframes zz{0%{opacity:0;transform:translate(0,0)}30%{opacity:1}100%{opacity:0;transform:translate(6px,-12px)}}.tv{animation:tv 2.6s steps(3) infinite}@keyframes tv{33%{fill:#ffd166}66%{fill:#ff8fab}}`
+  const source =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${f(minX)} ${f(minY)} ${f(VW)} ${f(VH)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="background:#0d0f16">` +
+    `<style>${css}</style><defs>${DEFS}${cityDefs(light)}</defs>` +
+    `<rect x="${f(minX)}" y="${f(minY)}" width="${f(VW)}" height="${f(VH)}" fill="url(#skybg)"/>` +
+    skyLights(light, minX, minY, VW) +
+    bodies +
+    (light.tint ? `<rect x="${f(minX)}" y="${f(minY)}" width="${f(VW)}" height="${f(VH)}" fill="${light.tint[0]}" opacity="${light.tint[1]}" style="mix-blend-mode:multiply"/>` : '') +
+    labels +
+    sign +
+    `</svg>`
+  return { source, width: VW, height: VH }
+}
+
+export function describeHomes(cast: number[], resetsAt: number | undefined): string {
+  const names = (cast.length ? cast : [0]).slice(0, 6).map(c => character(c).name)
+  return `Out of usage: ${names.join(', ')} went home${resetsAt ? `, back at ${clockTime(resetsAt)}` : ''}.`
 }

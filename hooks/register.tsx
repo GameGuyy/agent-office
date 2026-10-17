@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { AgentStatus, BgTask, ChatLine, OfficeAgent, OfficeStats, Scene, Stage, Theme } from '../types'
-import { CHAT_SHOW_MS, describeOffice, renderOffice } from './iso'
-import { GREET_MS, HUDDLE_MS, LEAVE_GAP_MS, layout, leadMode, visitArrival } from './stage'
+import type { AgentStatus, BgTask, ChatLine, OfficeAgent, OfficeStats, Scene, Stage, Theme, Usage } from '../types'
+import { CHAT_SHOW_MS, clockTime, describeHomes, describeOffice, renderHomes, renderOffice } from './iso'
+import { EXODUS_MS, GREET_MS, HUDDLE_MS, LEAVE_GAP_MS, layout, leadMode, visitArrival } from './stage'
 import { KIND_LABEL, STATUS_COLOR, activityLine, character, classify, clip, fmtAge, levelOf, phaseOf, pickCharacter, subtitle } from './office'
 
 const PANE = 'agent-office'
@@ -35,6 +35,7 @@ const inspectAtom = atom({ plugin: 'agent-office', key: 'inspect' } as const, fa
 const chatAtom = atom({ plugin: 'agent-office', key: 'chat' } as const, [])
 const EMPTY_STAGE: Stage = { lead: { mode: 'lounge', since: 0, from: 'lounge' }, crew: [], visits: [] }
 const stageAtom = atom({ plugin: 'agent-office', key: 'stage' } as const, EMPTY_STAGE)
+const usageAtom = atom({ plugin: 'agent-office', key: 'usage' } as const, null)
 /** Prompts from you, as opposed to notifications, schedules or other sessions. */
 const YOUR_PROMPTS = new Set(['composer', 'bridge', 'sdk'])
 /**
@@ -179,6 +180,62 @@ async function noticeFiles($: $, id: string, tool: string, input: Record<string,
   if (tool !== 'Read') edits.set(path, { id, at: now })
 }
 
+// ---------------------------------------------------------------- usage
+
+// everyone who has had a desk this session, for their homes
+let roster: number[] = []
+
+/** Everyone gets up and goes home until usage resets; the office empties, then their homes show. */
+async function goHome($: $, resetsAt: number | undefined, isPreview = false) {
+  if ((await read($, stageAtom)).away) return
+  const since = await $.clock.now()
+  const agents = await read($, agentsAtom)
+  const cast = [...new Set([0, ...agents.map(a => a.character), ...roster])].slice(0, 6)
+  await stageChange($, st => ({ ...st, away: { since, cast, ...(resetsAt ? { resetsAt } : {}), ...(isPreview ? { isPreview: true } : {}) } }))
+  await log($, 0, `Out of usage: everyone went home${resetsAt ? `, back at ${clockTime(resetsAt)}` : ''}`)
+}
+
+/** Usage is back: the homes give way to the office, the lead on the couch until there is work. */
+async function comeBack($: $) {
+  if (!(await read($, stageAtom)).away) return
+  const now = await $.clock.now()
+  await stageChange($, st => {
+    const { away: _away, ...rest } = st
+    return { ...rest, lead: { mode: 'lounge', since: now, from: 'lounge' } }
+  })
+  await log($, 0, 'Usage is back: everyone is in the office')
+}
+
+/** The fullest window, and whether any is spent: past 100% everyone goes home until the last of those resets. */
+async function noteUsage($: $, limits: readonly SessionRateLimit[]) {
+  const top = [...limits].sort((a, b) => b.percentUsed - a.percentUsed)[0]
+  if (!top) return
+  const at = (l: SessionRateLimit) => (l.resetsAt ? Date.parse(l.resetsAt) : NaN)
+  const usage: Usage = { percent: top.percentUsed, kind: top.kind, ...(Number.isFinite(at(top)) ? { resetsAt: at(top) } : {}) }
+  await update($, usageAtom, () => usage)
+  const spent = limits.filter(l => l.percentUsed >= 100)
+  if (spent.length) {
+    const back = Math.max(...spent.map(at).filter(Number.isFinite))
+    await goHome($, Number.isFinite(back) ? back : undefined)
+  } else {
+    const away = (await read($, stageAtom)).away
+    if (away && !away.isPreview) await comeBack($)
+  }
+}
+
+/** What the rows under the picture say about usage: the countdown home, or how much is left. */
+function usageLine(usage: Usage | null, stage: Stage, now: number): { text: string; color: string } | undefined {
+  const away = stage.away
+  if (away) {
+    const when = away.resetsAt
+    return { text: `🏠 Everyone went home · back ${when ? `in ${fmtAge(when - now)} (at ${clockTime(when)})` : 'when usage resets'}${away.isPreview ? ' · preview' : ''}`, color: '#cdb4ff' }
+  }
+  if (!usage) return undefined
+  const resets = usage.resetsAt ? ` · resets in ${fmtAge(usage.resetsAt - now)} (at ${clockTime(usage.resetsAt)})` : ''
+  if (usage.percent >= 90) return { text: `⚠ Usage ${Math.round(usage.percent)}% used: everyone goes home at 100%${resets}`, color: '#f87171' }
+  return { text: `⚡ Usage ${Math.round(usage.percent)}% used${resets}`, color: usage.percent >= 80 ? '#fbbf24' : '#86efac' }
+}
+
 // ---------------------------------------------------------------- stats
 
 /** Moves the per-minute history up to `minute`, zero-filling the quiet minutes. */
@@ -238,6 +295,7 @@ async function seat($: $, id: string, role: string, task: string, group?: string
     await stageChange($, st => ({ ...st, crew: [...st.crew.filter(c => c.id !== id), { id, joinedAt: at }].slice(-6) }))
   }
   if (joined) {
+    if (!roster.includes(joined.character)) roster = [...roster, joined.character].slice(-8)
     await remember($, role, joined.character)
     await log($, joined.character, `${character(joined.character).name} joined${task ? `: ${clip(task, 40)}` : ''}`)
   }
@@ -376,8 +434,11 @@ async function syncView($: $, force = false) {
   const feed = await read($, feedAtom)
   const stats = await read($, statsAtom)
   const allChat = await read($, chatAtom)
+  if ((await read($, stageAtom)).away?.resetsAt !== undefined && now >= ((await read($, stageAtom)).away?.resetsAt ?? Infinity)) await comeBack($)
   let stage = await read($, stageAtom)
-  const mode = leadMode(stage, agents.find(a => a.id === 'main'), now)
+  const usage = await read($, usageAtom)
+  // while everyone is away the lead goes nowhere: it has walked out with the rest
+  const mode = stage.away ? stage.lead.mode : leadMode(stage, agents.find(a => a.id === 'main'), now)
   const stale =
     (stage.visitor && now - stage.visitor.since > GREET_MS) ||
     stage.visits.some(v => now - v.at > 40_000) ||
@@ -398,7 +459,8 @@ async function syncView($: $, force = false) {
   }
   // the log shows what has been said by now; replies written ahead wait their turn
   const said = allChat.filter(c => c.at <= now)
-  const live = JSON.stringify([agents, tasks, feed, stats, said])
+  // the countdown in the rows moves on each minute, with no new picture
+  const live = JSON.stringify([agents, tasks, feed, stats, said, usage, stage.away ?? 0, usage || stage.away ? Math.floor(now / 60_000) : 0])
   if (force || live !== lastLive) {
     lastLive = live
     await update($, liveAtom, () => ({ at: now, agents, tasks, feed, stats, chat: said.slice(-6) }))
@@ -415,13 +477,21 @@ async function syncView($: $, force = false) {
   const theme = await read($, themeAtom)
   const sig =
     sceneSig(pictured, tasks) +
-    JSON.stringify([phaseOf('auto', hour), newest ? [newest.at, newest.from] : 0, stageRev, theme])
+    JSON.stringify([
+      phaseOf('auto', hour),
+      newest ? [newest.at, newest.from] : 0,
+      stageRev,
+      theme,
+      // everyone walking out, then at home; the meter in steps of 5%
+      stage.away ? `${stage.away.since}:${now - stage.away.since >= EXODUS_MS ? 'home' : 'out'}` : '',
+      usage ? Math.floor(usage.percent / 5) : -1,
+    ])
   const isDue =
     sig !== lastSceneSig ? now - lastSceneAt >= SCENE_MIN_MS : tasks.length > 0 && now - lastSceneAt >= AGE_REFRESH_MS
   if (force || isDue) {
     lastSceneSig = sig
     lastSceneAt = now
-    const scene: Scene = { at: now, agents: pictured, tasks, stats: drawn, hour, chat, stage, theme }
+    const scene: Scene = { at: now, agents: pictured, tasks, stats: drawn, hour, chat, stage, theme, ...(usage ? { usage } : {}) }
     await update($, sceneAtom, () => scene)
     await present($, scene, force)
   }
@@ -456,16 +526,27 @@ async function present($: $, scene: Scene, force: boolean) {
 // drawings already made, by scene and slot: the pane redraws often, a scene seldom
 const drawnCache = new Map<string, { source: string; width: number; height: number }>()
 
+/** Everyone has walked out and is at home: the picture is their homes, not the office. */
+function isHomes(scene: Scene): boolean {
+  const away = scene.stage?.away
+  return away !== undefined && scene.at - away.since >= EXODUS_MS
+}
+
 function drawScene(scene: Scene) {
-  const key = `${scene.at}:${scene.theme ?? 'auto'}:${scene.agents.length}`
+  const key = `${scene.at}:${scene.theme ?? 'auto'}:${scene.agents.length}:${isHomes(scene)}`
   let out = drawnCache.get(key)
   if (!out) {
-    out = renderOffice(scene.agents, scene.tasks, scene.stats, scene.at, {
-      theme: scene.theme ?? 'auto',
-      hour: scene.hour ?? 12,
-      chat: scene.chat ?? [],
-      ...(scene.stage ? { stage: scene.stage } : {}),
-    })
+    const away = scene.stage?.away
+    out =
+      away && isHomes(scene)
+        ? renderHomes(away.cast, away.since, away.resetsAt, scene.at, { theme: scene.theme ?? 'auto', hour: scene.hour ?? 12 })
+        : renderOffice(scene.agents, scene.tasks, scene.stats, scene.at, {
+            theme: scene.theme ?? 'auto',
+            hour: scene.hour ?? 12,
+            chat: scene.chat ?? [],
+            ...(scene.stage ? { stage: scene.stage } : {}),
+            ...(scene.usage ? { usage: scene.usage } : {}),
+          })
     drawnCache.set(key, out)
     while (drawnCache.size > 4) drawnCache.delete(drawnCache.keys().next().value as string)
   }
@@ -494,10 +575,15 @@ export const register: Register = on => {
     await $.command.register({
       name: 'office',
       description: 'Open the agent office: Claude and its subagents at their desks, live',
-      argumentHint: '[cast | reset-cast | theme auto|day|dusk|night | inspect]',
+      argumentHint: '[cast | reset-cast | theme auto|day|dusk|night | inspect | homes [minutes|off]]',
     })
     const now = await $.clock.now()
     await update($, agentsAtom, list => (list.some(a => a.id === 'main') ? list : [newAgent('main', 'main', '', 0, now), ...list]))
+    try {
+      await noteUsage($, (await $.session.usage()).rateLimits)
+    } catch {
+      // no reading yet: the meter appears with the first one
+    }
     await syncView($, true)
     $.clock.every(SYNC_MS, () => {
       void syncView($)
@@ -523,6 +609,18 @@ export const register: Register = on => {
     if (verb === 'inspect') {
       const isOn = await toggleInspect($)
       return { text: isOn ? 'Agent office: inspect on; hover a desk for its details.' : 'Agent office: inspect off.' }
+    }
+    if (verb === 'homes') {
+      if (value === 'off') {
+        await comeBack($)
+        await syncView($, true)
+        return { text: 'Agent office: everyone is back in the office.' }
+      }
+      const minutes = Number(value ?? 90)
+      const back = (await $.clock.now()) + (Number.isFinite(minutes) && minutes > 0 ? minutes : 90) * 60_000
+      await goHome($, back, true)
+      await syncView($, true)
+      return { text: `Agent office: everyone walks home (a preview, back at ${clockTime(back)}); /office homes off brings them back.` }
     }
     if (arg === 'cast') {
       const rows = Object.entries(cast).map(([role, i]) => `- ${role} → ${character(i).name}`)
@@ -647,6 +745,34 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('session.measure', async ($, e, next) => {
+    try {
+      await noteUsage($, e.rateLimits)
+    } catch {
+      // the office is best effort
+    }
+    return next(e)
+  })
+
+  on('classic.StopFailure', async ($, e, next) => {
+    try {
+      if (e.error === 'rate_limit') {
+        let limits: readonly SessionRateLimit[] = []
+        try {
+          limits = (await $.session.usage()).rateLimits
+        } catch {
+          // no reading: home without a time to come back
+        }
+        await noteUsage($, limits)
+        const spent = [...limits].sort((a, b) => b.percentUsed - a.percentUsed)[0]
+        await goHome($, spent?.resetsAt ? Date.parse(spent.resetsAt) : undefined)
+      }
+    } catch {
+      // as above
+    }
+    return next(e)
+  })
+
   on('classic.Stop', async ($, e, next) => {
     try {
       await reconcileTasks($, e.background_tasks)
@@ -693,6 +819,7 @@ export const register: Register = on => {
       await update($, tasksAtom, () => [])
       await update($, chatAtom, () => [])
       await stageChange($, () => EMPTY_STAGE)
+      roster = []
       edits.clear()
       remarked.clear()
       briefs.clear()
@@ -709,6 +836,7 @@ export const register: Register = on => {
       .filter(([k, n]) => (n ?? 0) > 0 && KIND_LABEL[k as AgentStatus])
       .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0)) as [AgentStatus, number][]
     const facts = (a: OfficeAgent) => ` Lv${levelOf(a.tools)} · ${a.tools} tools · ${fmtAge(now - a.joinedAt)}`
+    const meter = usageLine(await read($, usageAtom), await read($, stageAtom), now)
 
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
@@ -717,6 +845,7 @@ export const register: Register = on => {
           <Text bold>
             Agent Office · {agents.length} at desks · {tasks.length} background · {stats.tools} tool calls · {stats.done} shipped
           </Text>
+          {meter && <Text color={meter.color}>{meter.text}</Text>}
           {kinds.length > 0 && (
             <Box>
               {kinds.map(([k, n]) => (
@@ -783,7 +912,13 @@ export const register: Register = on => {
     // both pictures take the same box, the taller one's, so neither shows past the other
     const height = Math.round(Math.max((width * drawnA.height) / drawnA.width, (width * drawnB.height) / drawnB.width))
     const frame = (slot: Scene, drawn: { source: string }) => (
-      <Svg source={drawn.source} alt={describeOffice(slot.agents, slot.tasks)} width={width} height={height} {...(inspect ? { isInteractive: true } : {})} />
+      <Svg
+        source={drawn.source}
+        alt={slot.stage?.away && isHomes(slot) ? describeHomes(slot.stage.away.cast, slot.stage.away.resetsAt) : describeOffice(slot.agents, slot.tasks)}
+        width={width}
+        height={height}
+        {...(inspect ? { isInteractive: true } : {})}
+      />
     )
     const working = agents.filter(a => a.status !== 'idle' || a.id === 'main')
     return (
@@ -805,6 +940,11 @@ export const register: Register = on => {
             {Math.round(zoom * 100)}% · {agents.length} at desks · {tasks.length} background · {stats.tools} tool calls · {stats.done} shipped
           </Text>
         </Box>
+        {meter && (
+          <Text key="usage" color={meter.color} bold>
+            {meter.text}
+          </Text>
+        )}
         {kinds.length > 0 && (
           <Box>
             {kinds.map(([k, n]) => (
