@@ -1,0 +1,14 @@
+{
+  "name": "agent-office",
+  "description": "Agent Office: a live, cozy pixel office for Claude Code.",
+  "owner": {
+    "name": "9Bit Studios"
+  },
+  "plugins": [
+    {
+      "name": "agent-office",
+      "source": "./",
+      "description": "A live, cozy pixel office where Claude and its subagents work, talk and walk around while your session runs."
+    }
+  ]
+}
